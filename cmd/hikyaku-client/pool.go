@@ -115,9 +115,11 @@ type pool struct {
 	next     int // the server to try first on the next dial, rotating round-robin
 }
 
-// serverState tracks one server's consecutive dial failures and when it may be
-// dialed again. A carrier the server never acknowledged also backs it off, because
-// with 0-RTT a dial succeeds before the server answers.
+// serverState tracks one server's consecutive failures and when it may be dialed
+// again. A TCP dial that fails and a carrier the server never acknowledged share the
+// same failure window: with 0-RTT a dial succeeds before the server answers, so only
+// an acknowledgement proves the server is healthy. The window grows 1s, 2s, 4s, then
+// 5s, and only one failure per window counts when carriers fail together.
 type serverState struct {
 	failures int
 	nextTry  time.Time
@@ -127,13 +129,24 @@ func newPool(servers []string, psk []byte, carriers int) *pool {
 	if len(servers) == 0 {
 		panic("hikyaku-client: newPool needs at least one server")
 	}
+	// Keep the first occurrence of each address: duplicate entries would leave state
+	// for only one of them reachable and make nextServer spin over identical servers.
+	seen := make(map[string]struct{}, len(servers))
+	unique := make([]string, 0, len(servers))
+	for _, server := range servers {
+		if _, ok := seen[server]; ok {
+			continue
+		}
+		seen[server] = struct{}{}
+		unique = append(unique, server)
+	}
 	waitBand := minWaitBand
-	if len(servers) > 1 {
+	if len(unique) > 1 {
 		waitBand = multiServerWaitBand
 	}
 	return &pool{
-		servers:  append([]string(nil), servers...),
-		states:   make([]serverState, len(servers)),
+		servers:  unique,
+		states:   make([]serverState, len(unique)),
 		psk:      psk,
 		waitBand: waitBand,
 		carriers: make([]*carrier, carriers),
@@ -161,8 +174,6 @@ func (p *pool) grow() {
 }
 
 func (p *pool) maintain(slot int) {
-	var rejected time.Duration // the backoff for consecutive unacknowledged carriers
-	var rejectedServer string  // the server that backoff belongs to
 	for {
 		server, wait := p.nextServer(time.Now())
 		if wait > 0 {
@@ -177,7 +188,6 @@ func (p *pool) maintain(slot int) {
 			// hands back the earliest wait instead of spinning.
 			continue
 		}
-		p.dialSucceeded(server)
 		c.slot = slot
 		p.set(slot, c)
 		log.Printf("carrier %d: ready (server %s)", slot, server)
@@ -220,17 +230,9 @@ func (p *pool) maintain(slot int) {
 		// as its successor may already be listening; the old server closed its listener
 		// first, so it is not reached again, and a refused dial backs off.
 		if c.conn.Acked() {
-			rejected, rejectedServer = 0, ""
-			p.dialSucceeded(server)
+			p.serverAcked(server)
 		} else {
-			// Backing off consecutive rejections is per server: a failure on another
-			// server starts again at the first step instead of inheriting this one's.
-			if server != rejectedServer {
-				rejected = 0
-			}
-			rejected = min(max(2*rejected, minBackoff), maxBackoff)
-			rejectedServer = server
-			p.backOff(server, rejected)
+			p.rejectFailed(server)
 		}
 	}
 }
@@ -272,7 +274,9 @@ func (p *pool) state(server string) *serverState {
 	return nil
 }
 
-func (p *pool) dialSucceeded(server string) {
+// serverAcked resets a server's failure window; only a carrier the server
+// acknowledged proves that it is healthy.
+func (p *pool) serverAcked(server string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if st := p.state(server); st != nil {
@@ -282,6 +286,18 @@ func (p *pool) dialSucceeded(server string) {
 }
 
 func (p *pool) dialFailed(server string) {
+	p.failServer(server)
+}
+
+// rejectFailed records a carrier the server never acknowledged as a failure of that
+// server, sharing its window with dial failures so consecutive rejections keep
+// backing off instead of restarting whenever maintain switches servers.
+func (p *pool) rejectFailed(server string) {
+	p.failServer(server)
+}
+
+// failServer records one failure in server's current window.
+func (p *pool) failServer(server string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	st := p.state(server)
@@ -301,19 +317,6 @@ func (p *pool) dialFailed(server string) {
 		backoff *= 2
 	}
 	st.nextTry = now.Add(min(backoff, maxBackoff))
-}
-
-// backOff delays server by at least d without touching its failure count.
-func (p *pool) backOff(server string, d time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	st := p.state(server)
-	if st == nil {
-		return
-	}
-	if next := time.Now().Add(d); next.After(st.nextTry) {
-		st.nextTry = next
-	}
 }
 
 func (p *pool) set(slot int, c *carrier) {
@@ -699,13 +702,15 @@ func (p *pool) probeOutage() {
 		for p.linkQuiet() {
 			server, wait := p.nextServer(time.Now())
 			if wait > 0 {
-				time.Sleep(wait)
+				time.Sleep(probeBackoff(wait))
 				continue
 			}
 			c, err := p.dial(server)
 			if err != nil {
 				log.Printf("link: probe to server %s: %v", server, err)
-				p.dialFailed(server)
+				// Probing recovers from an outage; it must not drive the longer
+				// per-server backoff that maintain uses. Retry at a short fixed pace.
+				time.Sleep(minBackoff)
 				continue
 			}
 			deadline := time.Now().Add(probeWait)
@@ -714,10 +719,10 @@ func (p *pool) probeOutage() {
 			}
 			if !c.conn.Acked() {
 				c.session.Close()
-				p.dialFailed(server)
+				time.Sleep(minBackoff)
 				continue
 			}
-			p.dialSucceeded(server)
+			p.serverAcked(server)
 			p.mu.Lock()
 			p.standby = append(p.standby, c)
 			p.wake()
@@ -727,6 +732,12 @@ func (p *pool) probeOutage() {
 			return
 		}
 	}()
+}
+
+// probeBackoff caps a per-server backoff wait for outage probing, so a long maintain
+// backoff cannot stall the probe that must find a recovered path.
+func probeBackoff(wait time.Duration) time.Duration {
+	return min(wait, minBackoff)
 }
 
 // retire keeps a standby carrier for its existing streams, which survive a short

@@ -441,9 +441,66 @@ func TestNextServerRotatesAndWaits(t *testing.T) {
 	if wait <= 0 || wait > time.Second {
 		t.Fatalf("wait %s, want the remaining part of the first backoff, up to %s", wait, time.Second)
 	}
-	p.dialSucceeded(p.servers[1])
+	p.serverAcked(p.servers[1])
 	if got, wait := p.nextServer(time.Now()); got != p.servers[1] || wait != 0 {
 		t.Fatalf("after the backoff reset: %q after %s, want %q at once", got, wait, p.servers[1])
+	}
+}
+
+// Consecutive rejections grow each server's own window. Switching servers between
+// rejections does not restart the backoff, and one server's window is not cleared by
+// another server's failure.
+func TestRejectionsBackOffPerServer(t *testing.T) {
+	a, b := "[2001:db8::a]:8444", "[2001:db8::b]:8444"
+	p := newPool([]string{a, b}, nil, 2)
+	p.rejectFailed(a)
+	p.rejectFailed(b)
+
+	p.mu.Lock()
+	aFailures, bFailures := p.states[0].failures, p.states[1].failures
+	aWait, bWait := time.Until(p.states[0].nextTry), time.Until(p.states[1].nextTry)
+	p.mu.Unlock()
+	if aFailures != 1 || bFailures != 1 {
+		t.Fatalf("failures after one rejection each: %d and %d, want 1 and 1", aFailures, bFailures)
+	}
+	for server, wait := range map[string]time.Duration{a: aWait, b: bWait} {
+		if wait < 900*time.Millisecond || wait > 1100*time.Millisecond {
+			t.Fatalf("server %s next try in %s, want about %s", server, wait, minBackoff)
+		}
+	}
+
+	// Let only A's window pass. A's next rejection grows its own count without
+	// touching B's window.
+	p.mu.Lock()
+	bNext := p.states[1].nextTry
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.rejectFailed(a)
+	p.mu.Lock()
+	aFailures, bFailures = p.states[0].failures, p.states[1].failures
+	aWait = time.Until(p.states[0].nextTry)
+	bNextNow := p.states[1].nextTry
+	p.mu.Unlock()
+	if aFailures != 2 {
+		t.Fatalf("%d failures on the rejecting server after its window passed, want 2", aFailures)
+	}
+	if aWait < 1800*time.Millisecond || aWait > 2200*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", aWait, 2*minBackoff)
+	}
+	if bFailures != 1 || !bNextNow.Equal(bNext) {
+		t.Fatalf("the other server changed to %d failures and next try %s, want 1 and %s", bFailures, bNextNow, bNext)
+	}
+
+	// B also grows to two, so neither server's window erased the other's.
+	p.mu.Lock()
+	p.states[1].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.rejectFailed(b)
+	p.mu.Lock()
+	bFailures = p.states[1].failures
+	p.mu.Unlock()
+	if bFailures != 2 {
+		t.Fatalf("%d failures on the second rejecting server after its window passed, want 2", bFailures)
 	}
 }
 
@@ -543,6 +600,44 @@ func TestNewPoolWaitBand(t *testing.T) {
 	}
 	if got := newPool([]string{"[2001:db8::a]:8444", "[2001:db8::b]:8444"}, nil, 1).waitBand; got != multiServerWaitBand {
 		t.Fatalf("multi-server wait band %s, want %s", got, multiServerWaitBand)
+	}
+}
+
+// Duplicate addresses collapse to one server so each address has one state and
+// nextServer never rotates between identical entries.
+func TestNewPoolDeduplicatesServers(t *testing.T) {
+	a, b := "[2001:db8::a]:8444", "[2001:db8::b]:8444"
+	p := newPool([]string{a, a, b, a}, nil, 1)
+	if len(p.servers) != 2 || p.servers[0] != a || p.servers[1] != b {
+		t.Fatalf("servers %v, want [%q %q]", p.servers, a, b)
+	}
+	if len(p.states) != len(p.servers) {
+		t.Fatalf("%d states for %d servers", len(p.states), len(p.servers))
+	}
+	if p.state(a) == p.state(b) {
+		t.Fatal("both addresses resolved to the same server state")
+	}
+	if got := p.waitBand; got != multiServerWaitBand {
+		t.Fatalf("wait band %s, want %s based on the two unique servers", got, multiServerWaitBand)
+	}
+
+	single := newPool([]string{a, a, a}, nil, 1)
+	if len(single.servers) != 1 || single.waitBand != minWaitBand {
+		t.Fatalf("%d servers with wait band %s, want one server and %s", len(single.servers), single.waitBand, minWaitBand)
+	}
+}
+
+// Outage probes wait at most one short backoff step, so a long maintain backoff
+// cannot stall probing for a recovered path.
+func TestProbeBackoffCapsWait(t *testing.T) {
+	if got := probeBackoff(maxBackoff); got != minBackoff {
+		t.Fatalf("probe wait %s, want %s", got, minBackoff)
+	}
+	if got := probeBackoff(250 * time.Millisecond); got != 250*time.Millisecond {
+		t.Fatalf("probe wait %s, want the shorter wait unchanged", got)
+	}
+	if got := probeBackoff(0); got != 0 {
+		t.Fatalf("probe wait %s, want none", got)
 	}
 }
 
