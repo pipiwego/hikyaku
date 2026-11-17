@@ -55,8 +55,12 @@ const (
 	// deadAfter closes a standby carrier whose ping has gone unanswered this long.
 	deadAfter = 30 * time.Second
 	// minWaitBand is the least a carrier's expected wait may exceed the best one's and
-	// still count as tied; otherwise the band is a quarter of the best.
-	minWaitBand = 5 * time.Millisecond
+	// still count as tied; otherwise the band is a quarter of the best. A pool with one
+	// server keeps the wider band: its carriers share a path, so a small difference is
+	// noise. Across servers a smaller difference is a genuinely quicker route, and a
+	// wrong pick costs the request that server's round trip.
+	minWaitBand         = 20 * time.Millisecond
+	multiServerWaitBand = 5 * time.Millisecond
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
@@ -101,6 +105,7 @@ type pool struct {
 	servers  []string
 	states   []serverState
 	psk      []byte
+	waitBand time.Duration
 	mu       sync.Mutex
 	carriers []*carrier
 	standby  []*carrier
@@ -119,10 +124,18 @@ type serverState struct {
 }
 
 func newPool(servers []string, psk []byte, carriers int) *pool {
+	if len(servers) == 0 {
+		panic("hikyaku-client: newPool needs at least one server")
+	}
+	waitBand := minWaitBand
+	if len(servers) > 1 {
+		waitBand = multiServerWaitBand
+	}
 	return &pool{
 		servers:  append([]string(nil), servers...),
 		states:   make([]serverState, len(servers)),
 		psk:      psk,
+		waitBand: waitBand,
 		carriers: make([]*carrier, carriers),
 		changed:  make(chan struct{}),
 	}
@@ -149,6 +162,7 @@ func (p *pool) grow() {
 
 func (p *pool) maintain(slot int) {
 	var rejected time.Duration // the backoff for consecutive unacknowledged carriers
+	var rejectedServer string  // the server that backoff belongs to
 	for {
 		server, wait := p.nextServer(time.Now())
 		if wait > 0 {
@@ -206,10 +220,16 @@ func (p *pool) maintain(slot int) {
 		// as its successor may already be listening; the old server closed its listener
 		// first, so it is not reached again, and a refused dial backs off.
 		if c.conn.Acked() {
-			rejected = 0
+			rejected, rejectedServer = 0, ""
 			p.dialSucceeded(server)
 		} else {
+			// Backing off consecutive rejections is per server: a failure on another
+			// server starts again at the first step instead of inheriting this one's.
+			if server != rejectedServer {
+				rejected = 0
+			}
 			rejected = min(max(2*rejected, minBackoff), maxBackoff)
+			rejectedServer = server
 			p.backOff(server, rejected)
 		}
 	}
@@ -268,12 +288,19 @@ func (p *pool) dialFailed(server string) {
 	if st == nil {
 		return
 	}
+	now := time.Now()
+	// Carriers fail together when their server goes away, so only the first failure
+	// after the previous backoff window opens the next one; the rest of that round
+	// leaves the window alone instead of multiplying the wait by the carrier count.
+	if st.nextTry.After(now) {
+		return
+	}
 	st.failures++
 	backoff := minBackoff
 	for i := 1; i < st.failures && backoff < maxBackoff; i++ {
 		backoff *= 2
 	}
-	st.nextTry = time.Now().Add(min(backoff, maxBackoff))
+	st.nextTry = now.Add(min(backoff, maxBackoff))
 }
 
 // backOff delays server by at least d without touching its failure count.
@@ -610,8 +637,10 @@ func (p *pool) watch(c *carrier) verdict {
 }
 
 // slower reports whether c's quiet round trips sit clearly above the best other
-// acknowledged carrier's; a carrier without enough of them, such as a busy one, is
-// not judged, and with no other carrier to compare against nothing is slow.
+// acknowledged carrier's on the same server; a carrier without enough of them, such
+// as a busy one, is not judged, and with no other carrier on its server to compare
+// against nothing is slow. Across servers quickest picks the better one, so a healthy
+// but slower server is not retired and redialed over and over.
 func (p *pool) slower(c *carrier) bool {
 	now := time.Now()
 	mine, ok := c.quietMedian(now)
@@ -621,7 +650,7 @@ func (p *pool) slower(c *carrier) bool {
 	p.mu.Lock()
 	best := time.Duration(-1)
 	for _, o := range p.carriers {
-		if o == nil || o == c || !o.conn.Acked() || o.session.IsClosed() {
+		if o == nil || o == c || o.server != c.server || !o.conn.Acked() || o.session.IsClosed() {
 			continue
 		}
 		if m, ok := o.quietMedian(now); ok && (best < 0 || m < best) {
@@ -769,7 +798,7 @@ func (p *pool) pick() *carrier {
 	if p.opened == 0 {
 		p.grow()
 	}
-	best := quickest(p.carriers)
+	best := quickest(p.carriers, p.waitBand)
 	if best != nil && (best.session.NumStreams() > 0 || !p.spare(best)) {
 		// Keep an idle carrier in reserve: open another in the background as soon as
 		// this one takes a stream, so a request that arrives during a long download
@@ -817,7 +846,7 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 
 // quickest picks the acknowledged carrier where a new stream should hear back
 // soonest, skipping any whose server is going away before watch moves it to standby.
-func quickest(carriers []*carrier) *carrier {
+func quickest(carriers []*carrier, band time.Duration) *carrier {
 	now := time.Now()
 	var acked []*carrier
 	var waits []time.Duration
@@ -833,20 +862,20 @@ func quickest(carriers []*carrier) *carrier {
 	if len(acked) == 0 {
 		return nil
 	}
-	return acked[choose(waits, streams)]
+	return acked[choose(waits, streams, band)]
 }
 
 // choose returns which carrier to use from each one's expected wait, negative when
-// unknown, and stream count. Waits within a band of the best count as tied, and so
-// do unknown ones; among the tied, the fewest streams wins.
-func choose(waits []time.Duration, streams []int) int {
+// unknown, and stream count. Waits within band of the best count as tied, and so do
+// unknown ones; among the tied, the fewest streams wins.
+func choose(waits []time.Duration, streams []int, band time.Duration) int {
 	fastest := time.Duration(-1)
 	for _, w := range waits {
 		if w >= 0 && (fastest < 0 || w < fastest) {
 			fastest = w
 		}
 	}
-	limit := fastest + max(fastest/4, minWaitBand)
+	limit := fastest + max(fastest/4, band)
 	best := -1
 	for i, w := range waits {
 		if fastest >= 0 && w > limit {

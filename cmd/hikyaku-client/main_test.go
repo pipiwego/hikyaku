@@ -14,6 +14,7 @@ func TestParseServers(t *testing.T) {
 	}{
 		{"none", nil, nil, true},
 		{"empty and commas", []string{"", " , ,", "  "}, nil, true},
+		{"single ordinary address", []string{"example.com:8444"}, []string{"example.com:8444"}, false},
 		{"trim and order", []string{" [2001:db8::a]:8444 , [2001:db8::b]:8444 ", " [2001:db8::a]:8444 "}, []string{"[2001:db8::a]:8444", "[2001:db8::b]:8444"}, false},
 		{"repeat and comma", []string{"[a]:1", "[b]:2,[c]:3", "[a]:1,, [d]:4"}, []string{"[a]:1", "[b]:2", "[c]:3", "[d]:4"}, false},
 	}

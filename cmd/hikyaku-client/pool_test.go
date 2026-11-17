@@ -60,14 +60,14 @@ func TestQuickestSkipsGoingAway(t *testing.T) {
 	p.mu.Unlock()
 	// Between GOAWAY and the next health check the carrier is still in its slot; mark
 	// the one that would be picked.
-	going := quickest(carriers)
+	going := quickest(carriers, p.waitBand)
 	if going == nil {
 		t.Fatal("no carrier picked")
 	}
 	reason := "test"
 	going.goaway.Store(&reason)
 	for range 20 {
-		c := quickest(carriers)
+		c := quickest(carriers, p.waitBand)
 		if c == nil {
 			t.Fatal("picked no carrier, want the one whose server is not going away")
 		}
@@ -356,23 +356,63 @@ func TestChoose(t *testing.T) {
 	ms := time.Millisecond
 	cases := []struct {
 		name    string
+		band    time.Duration
 		waits   []time.Duration
 		streams []int
 		want    int
 	}{
-		{"a clearly quicker carrier beats fewer streams", []time.Duration{600 * ms, 1200 * ms}, []int{3, 0}, 0},
-		{"within the band, fewest streams wins", []time.Duration{600 * ms, 700 * ms}, []int{3, 0}, 1},
-		{"within the minWaitBand, fewest streams wins", []time.Duration{30 * ms, 32 * ms}, []int{2, 0}, 1},
-		{"just outside a small band", []time.Duration{30 * ms, 40 * ms}, []int{2, 0}, 0},
-		{"18ms does not lose to 25ms", []time.Duration{18 * ms, 25 * ms}, []int{1, 0}, 0},
-		{"an unknown wait counts as tied", []time.Duration{-1, 600 * ms}, []int{0, 2}, 0},
-		{"all unknown falls back to fewest streams", []time.Duration{-1, -1}, []int{1, 0}, 1},
-		{"equal carriers keep slot order", []time.Duration{600 * ms, 600 * ms}, []int{1, 1}, 0},
+		// One server keeps the 20ms band, so small round-trip differences on its
+		// shared path count as tied.
+		{"single server: a clearly quicker carrier beats fewer streams", minWaitBand, []time.Duration{600 * ms, 1200 * ms}, []int{3, 0}, 0},
+		{"single server: within the band, fewest streams wins", minWaitBand, []time.Duration{600 * ms, 700 * ms}, []int{3, 0}, 1},
+		{"single server: the band is at least minWaitBand", minWaitBand, []time.Duration{30 * ms, 45 * ms}, []int{2, 0}, 1},
+		{"single server: just outside the band", minWaitBand, []time.Duration{30 * ms, 60 * ms}, []int{2, 0}, 0},
+		// Across servers the band is 5ms, so a few milliseconds pick the quicker route.
+		{"multiple servers: within the band, fewest streams wins", multiServerWaitBand, []time.Duration{30 * ms, 32 * ms}, []int{2, 0}, 1},
+		{"multiple servers: 18ms does not lose to 25ms", multiServerWaitBand, []time.Duration{18 * ms, 25 * ms}, []int{1, 0}, 0},
+		{"an unknown wait counts as tied", minWaitBand, []time.Duration{-1, 600 * ms}, []int{0, 2}, 0},
+		{"all unknown falls back to fewest streams", minWaitBand, []time.Duration{-1, -1}, []int{1, 0}, 1},
+		{"equal carriers keep slot order", minWaitBand, []time.Duration{600 * ms, 600 * ms}, []int{1, 1}, 0},
 	}
 	for _, c := range cases {
-		if got := choose(c.waits, c.streams); got != c.want {
+		if got := choose(c.waits, c.streams, c.band); got != c.want {
 			t.Errorf("%s: chose %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// A server that goes away makes every carrier fail in the same round; those failures
+// share one backoff window instead of multiplying the wait by the carrier count.
+func TestDialFailedBacksOffOncePerWindow(t *testing.T) {
+	p := newPool([]string{"[2001:db8::a]:8444"}, nil, 4)
+	server := p.servers[0]
+	for range 4 {
+		p.dialFailed(server)
+	}
+	p.mu.Lock()
+	failures := p.states[0].failures
+	wait := time.Until(p.states[0].nextTry)
+	p.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("%d failures after four dials in one round, want 1", failures)
+	}
+	if wait < 900*time.Millisecond || wait > 1100*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", wait, minBackoff)
+	}
+
+	p.mu.Lock()
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.dialFailed(server)
+	p.mu.Lock()
+	failures = p.states[0].failures
+	wait = time.Until(p.states[0].nextTry)
+	p.mu.Unlock()
+	if failures != 2 {
+		t.Fatalf("%d failures after the window passed, want 2", failures)
+	}
+	if wait < 1800*time.Millisecond || wait > 2200*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", wait, 2*minBackoff)
 	}
 }
 
@@ -388,6 +428,10 @@ func TestNextServerRotatesAndWaits(t *testing.T) {
 		t.Fatalf("second server %q after %s, want %q at once", got, wait, p.servers[1])
 	}
 	p.dialFailed(p.servers[0])
+	// Let the second failure of the first server count, so the two backoffs differ.
+	p.mu.Lock()
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
 	p.dialFailed(p.servers[0])
 	p.dialFailed(p.servers[1])
 	got, wait := p.nextServer(time.Now())
@@ -430,8 +474,75 @@ func TestQuickestAcrossServers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := quickest([]*carrier{slow, fast}); got != fast {
-		t.Fatalf("picked carrier on %s with %d streams, want the faster %s", got.server, got.session.NumStreams(), fast.server)
+	if got := quickest([]*carrier{slow, fast}, multiServerWaitBand); got != fast {
+		t.Fatalf("multi-server pool picked carrier on %s with %d streams, want the faster %s", got.server, got.session.NumStreams(), fast.server)
+	}
+	// The 20ms single-server band ties 20ms with 5ms, so there the fewer streams win.
+	if got := quickest([]*carrier{slow, fast}, minWaitBand); got != slow {
+		t.Fatalf("single-server pool picked carrier on %s with %d streams, want the one with fewer streams on %s", got.server, got.session.NumStreams(), slow.server)
+	}
+}
+
+// Slowness is judged within one server. A healthy but slower server is chosen against
+// by quickest, not retired and redialed as a slow carrier.
+func TestSlowerOnlyComparesWithinServer(t *testing.T) {
+	psk := "slower-within-server-test"
+	a := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	b := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	p := newPool([]string{a, b}, []byte(psk), 2)
+	slow, err := p.dial(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.session.Close()
+	fast, err := p.dial(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.session.Close()
+	waitFor(t, "both carriers acknowledged", func() bool { return slow.conn.Acked() && fast.conn.Acked() })
+	slow.slot, fast.slot = 0, 1
+	p.set(0, slow)
+	p.set(1, fast)
+	now := time.Now()
+	slow.quiet = []sample{{now, 900 * time.Millisecond}, {now, 900 * time.Millisecond}, {now, 900 * time.Millisecond}}
+	fast.quiet = []sample{{now, 30 * time.Millisecond}, {now, 30 * time.Millisecond}, {now, 30 * time.Millisecond}}
+	if p.slower(slow) {
+		t.Fatalf("the only carrier on %s was judged slow against another server", slow.server)
+	}
+
+	sameServer, err := p.dial(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sameServer.session.Close()
+	waitFor(t, "the second carrier on the same server acknowledged", sameServer.conn.Acked)
+	sameServer.slot = 1
+	sameServer.quiet = fast.quiet
+	p.set(1, sameServer)
+	if !p.slower(slow) {
+		t.Fatalf("carrier on %s was not judged slow against a quicker carrier on its own server", slow.server)
+	}
+}
+
+// A pool needs a server; the CLI checks this, but library and test callers must not
+// get an empty round-robin that spins at full speed.
+func TestNewPoolNeedsServer(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("newPool with no servers did not panic")
+		}
+	}()
+	newPool(nil, nil, 1)
+}
+
+// The wait band depends on how many servers the pool may use.
+func TestNewPoolWaitBand(t *testing.T) {
+	if got := newPool([]string{"[2001:db8::a]:8444"}, nil, 1).waitBand; got != minWaitBand {
+		t.Fatalf("single-server wait band %s, want %s", got, minWaitBand)
+	}
+	if got := newPool([]string{"[2001:db8::a]:8444", "[2001:db8::b]:8444"}, nil, 1).waitBand; got != multiServerWaitBand {
+		t.Fatalf("multi-server wait band %s, want %s", got, multiServerWaitBand)
 	}
 }
 
