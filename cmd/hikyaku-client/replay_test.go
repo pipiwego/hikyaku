@@ -60,7 +60,7 @@ func TestReplay(t *testing.T) {
 
 	closeSession := func(c *carrier) { c.session.Close() }
 	run := func(t *testing.T, firstFlight []byte, kill func(*carrier)) (net.Conn, <-chan []byte) {
-		p := newPool(server, []byte(psk), 2)
+		p := newPool([]string{server}, []byte(psk), 2)
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -143,7 +143,7 @@ func TestCutOffResponseIsReset(t *testing.T) {
 	key := make([]byte, 32)
 	rand.Read(key)
 	psk := base64.StdEncoding.EncodeToString(key)
-	p := newPool(startServer(t, psk), []byte(psk), 2)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 2)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +239,7 @@ func TestAbandonResetsStream(t *testing.T) {
 			}()
 		}
 	}()
-	p := newPool(ln.Addr().String(), psk, 1)
+	p := newPool([]string{ln.Addr().String()}, psk, 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
 	r, err := newReplayStream(&inbound{pool: p}, proxy.Addr{Domain: "example.com", Port: 443})

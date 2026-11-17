@@ -55,14 +55,19 @@ const (
 	// deadAfter closes a standby carrier whose ping has gone unanswered this long.
 	deadAfter = 30 * time.Second
 	// minWaitBand is the least a carrier's expected wait may exceed the best one's and
-	// still count as tied; otherwise the band is a quarter of the best.
-	minWaitBand = 20 * time.Millisecond
+	// still count as tied; otherwise the band is a quarter of the best. A pool with one
+	// server keeps the wider band: its carriers share a path, so a small difference is
+	// noise. Across servers a smaller difference is a genuinely quicker route, and a
+	// wrong pick costs the request that server's round trip.
+	minWaitBand         = 20 * time.Millisecond
+	multiServerWaitBand = 5 * time.Millisecond
 )
 
 var errNoCarrier = errors.New("no carrier is ready")
 
 type carrier struct {
 	slot    int
+	server  string
 	session *smux.Session
 	conn    *proxy.Conn
 	ready   time.Time
@@ -97,18 +102,56 @@ type sample struct {
 // nil while its carrier is down and keeps being redialed. Silent carriers wait on
 // standby until their slot has a replacement.
 type pool struct {
-	server   string
+	servers  []string
+	states   []serverState
 	psk      []byte
+	waitBand time.Duration
 	mu       sync.Mutex
 	carriers []*carrier
 	standby  []*carrier
 	opened   int
 	changed  chan struct{} // closed and replaced whenever a carrier becomes usable
 	probing  atomic.Bool
+	next     int // the server to try first on the next dial, rotating round-robin
 }
 
-func newPool(server string, psk []byte, carriers int) *pool {
-	return &pool{server: server, psk: psk, carriers: make([]*carrier, carriers), changed: make(chan struct{})}
+// serverState tracks one server's consecutive failures and when it may be dialed
+// again. A TCP dial that fails and a carrier the server never acknowledged share the
+// same failure window: with 0-RTT a dial succeeds before the server answers, so only
+// an acknowledgement proves the server is healthy. The window grows 1s, 2s, 4s, then
+// 5s, and only one failure per window counts when carriers fail together.
+type serverState struct {
+	failures int
+	nextTry  time.Time
+}
+
+func newPool(servers []string, psk []byte, carriers int) *pool {
+	if len(servers) == 0 {
+		panic("hikyaku-client: newPool needs at least one server")
+	}
+	// Keep the first occurrence of each address: duplicate entries would leave state
+	// for only one of them reachable and make nextServer spin over identical servers.
+	seen := make(map[string]struct{}, len(servers))
+	unique := make([]string, 0, len(servers))
+	for _, server := range servers {
+		if _, ok := seen[server]; ok {
+			continue
+		}
+		seen[server] = struct{}{}
+		unique = append(unique, server)
+	}
+	waitBand := minWaitBand
+	if len(unique) > 1 {
+		waitBand = multiServerWaitBand
+	}
+	return &pool{
+		servers:  unique,
+		states:   make([]serverState, len(unique)),
+		psk:      psk,
+		waitBand: waitBand,
+		carriers: make([]*carrier, carriers),
+		changed:  make(chan struct{}),
+	}
 }
 
 // warm opens the first carrier before any request, so one that arrives a round trip
@@ -131,39 +174,44 @@ func (p *pool) grow() {
 }
 
 func (p *pool) maintain(slot int) {
-	var backoff time.Duration
 	for {
-		c, err := p.dial()
+		server, wait := p.nextServer(time.Now())
+		if wait > 0 {
+			time.Sleep(wait)
+			continue
+		}
+		c, err := p.dial(server)
 		if err != nil {
-			log.Printf("carrier %d: %v", slot, err)
-			backoff = min(max(2*backoff, minBackoff), maxBackoff)
-			time.Sleep(backoff)
+			log.Printf("carrier %d: server %s: %v", slot, server, err)
+			p.dialFailed(server)
+			// Try another server at once; when every one is backing off, nextServer
+			// hands back the earliest wait instead of spinning.
 			continue
 		}
 		c.slot = slot
 		p.set(slot, c)
-		log.Printf("carrier %d: ready", slot)
+		log.Printf("carrier %d: ready (server %s)", slot, server)
 		v := p.watch(c)
 		silent := v == silent || v == noAck
 		switch {
 		case v == goingAway:
 			// The server keeps serving the carrier's streams, so they stay where they are.
 			p.toStandby(c)
-			log.Printf("carrier %d: %s after %s, standing by", slot, *c.goaway.Load(), c.lifetime())
+			log.Printf("carrier %d: server %s: %s after %s, standing by", slot, server, *c.goaway.Load(), c.lifetime())
 			go p.retire(c)
 		case v == slow:
 			p.toStandby(c)
 			c.moveUnanswered()
-			log.Printf("carrier %d: slower than the best other carrier while quiet for %d checks after %s, standing by",
-				slot, slowStrikes, c.lifetime())
+			log.Printf("carrier %d: server %s: slower than the best other carrier while quiet for %d checks after %s, standing by",
+				slot, server, slowStrikes, c.lifetime())
 			go p.retire(c)
 		case silent && c.conn.Acked():
 			p.toStandby(c)
 			c.moveUnanswered()
 			if v == noAck {
-				log.Printf("carrier %d: acknowledgement overdue by %s after %s, standing by", slot, c.replyDeadline(), c.lifetime())
+				log.Printf("carrier %d: server %s: acknowledgement overdue by %s after %s, standing by", slot, server, c.replyDeadline(), c.lifetime())
 			} else {
-				log.Printf("carrier %d: silent for %s after %s, standing by", slot, c.replyDeadline(), c.lifetime())
+				log.Printf("carrier %d: server %s: silent for %s after %s, standing by", slot, server, c.replyDeadline(), c.lifetime())
 			}
 			go p.retire(c)
 		case silent:
@@ -171,23 +219,104 @@ func (p *pool) maintain(slot int) {
 			// its streams now lets apps retry instead of waiting on a dead standby.
 			p.set(slot, nil)
 			c.session.Close()
-			log.Printf("carrier %d: no acknowledgement after %s, closing", slot, c.lifetime())
+			log.Printf("carrier %d: server %s: no acknowledgement after %s, closing", slot, server, c.lifetime())
 		default:
 			p.set(slot, nil)
-			log.Printf("carrier %d: closed after %s: %s", slot, c.lifetime(), c.closeReason())
+			log.Printf("carrier %d: server %s: closed after %s: %s", slot, server, c.lifetime(), c.closeReason())
 		}
 		// With 0-RTT a dial succeeds before the server answers, so a carrier it never
-		// acknowledged, such as one with the wrong PSK, counts as a failed dial. One sent
-		// away by a server that is shutting down is redialed at once, as its successor may
-		// already be listening; the old server closed its listener first, so it is not
-		// reached again, and a refused dial backs off.
+		// acknowledged, such as one with the wrong PSK, backs the server off as a failed
+		// dial would. One sent away by a server that is shutting down is redialed at once,
+		// as its successor may already be listening; the old server closed its listener
+		// first, so it is not reached again, and a refused dial backs off.
 		if c.conn.Acked() {
-			backoff = 0
+			p.serverAcked(server)
 		} else {
-			backoff = min(max(2*backoff, minBackoff), maxBackoff)
-			time.Sleep(backoff)
+			p.rejectFailed(server)
 		}
 	}
+}
+
+// nextServer returns the server to dial next, rotating the round-robin start after
+// each choice. When every server is backing off, it returns the one available
+// soonest and how long to wait for it, so maintain waits instead of polling.
+func (p *pool) nextServer(now time.Time) (server string, wait time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := len(p.servers)
+	if n == 0 {
+		return "", 0
+	}
+	for i := range n {
+		idx := (p.next + i) % n
+		if !p.states[idx].nextTry.After(now) {
+			p.next = (idx + 1) % n
+			return p.servers[idx], 0
+		}
+	}
+	earliest := 0
+	for i := 1; i < n; i++ {
+		if p.states[i].nextTry.Before(p.states[earliest].nextTry) {
+			earliest = i
+		}
+	}
+	p.next = earliest
+	return p.servers[earliest], p.states[earliest].nextTry.Sub(now)
+}
+
+// state returns the state of server; the caller holds p.mu.
+func (p *pool) state(server string) *serverState {
+	for i, s := range p.servers {
+		if s == server {
+			return &p.states[i]
+		}
+	}
+	return nil
+}
+
+// serverAcked resets a server's failure window; only a carrier the server
+// acknowledged proves that it is healthy.
+func (p *pool) serverAcked(server string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if st := p.state(server); st != nil {
+		st.failures = 0
+		st.nextTry = time.Time{}
+	}
+}
+
+func (p *pool) dialFailed(server string) {
+	p.failServer(server)
+}
+
+// rejectFailed records a carrier the server never acknowledged as a failure of that
+// server, sharing its window with dial failures so consecutive rejections keep
+// backing off instead of restarting whenever maintain switches servers.
+func (p *pool) rejectFailed(server string) {
+	p.failServer(server)
+}
+
+// failServer records one failure in server's current window.
+func (p *pool) failServer(server string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	st := p.state(server)
+	if st == nil {
+		return
+	}
+	now := time.Now()
+	// Carriers fail together when their server goes away, so only the first failure
+	// after the previous backoff window opens the next one; the rest of that round
+	// leaves the window alone instead of multiplying the wait by the carrier count.
+	if st.nextTry.After(now) {
+		return
+	}
+	st.failures++
+	backoff := minBackoff
+	for i := 1; i < st.failures && backoff < maxBackoff; i++ {
+		backoff *= 2
+	}
+	st.nextTry = now.Add(min(backoff, maxBackoff))
 }
 
 func (p *pool) set(slot int, c *carrier) {
@@ -219,8 +348,8 @@ func (p *pool) replaced(slot int) bool {
 	return c != nil && c.conn.Acked()
 }
 
-func (p *pool) dial() (*carrier, error) {
-	conn, err := net.DialTimeout("tcp", p.server, dialTimeout)
+func (p *pool) dial(server string) (*carrier, error) {
+	conn, err := net.DialTimeout("tcp", server, dialTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +358,7 @@ func (p *pool) dial() (*carrier, error) {
 		conn.Close()
 		return nil, err
 	}
-	c := &carrier{conn: pc, pings: make(map[uint32]ping), pingNow: make(chan bool, 1)}
+	c := &carrier{server: server, conn: pc, pings: make(map[uint32]ping), pingNow: make(chan bool, 1)}
 	pc.OnControl(c.control)
 	session, err := smux.Client(pc, proxy.MuxConfig())
 	if err != nil {
@@ -503,16 +632,18 @@ func (p *pool) watch(c *carrier) verdict {
 				c.mu.Lock()
 				srtt := c.srtt
 				c.mu.Unlock()
-				log.Printf("carrier %d: rtt %s, reply deadline %s, %d streams", c.slot, srtt.Round(time.Millisecond),
-					c.replyDeadline().Round(time.Millisecond), c.session.NumStreams())
+				log.Printf("carrier %d: server %s: rtt %s, reply deadline %s, %d streams", c.slot, c.server,
+					srtt.Round(time.Millisecond), c.replyDeadline().Round(time.Millisecond), c.session.NumStreams())
 			}
 		}
 	}
 }
 
 // slower reports whether c's quiet round trips sit clearly above the best other
-// acknowledged carrier's; a carrier without enough of them, such as a busy one, is
-// not judged, and with no other carrier to compare against nothing is slow.
+// acknowledged carrier's on the same server; a carrier without enough of them, such
+// as a busy one, is not judged, and with no other carrier on its server to compare
+// against nothing is slow. Across servers quickest picks the better one, so a healthy
+// but slower server is not retired and redialed over and over.
 func (p *pool) slower(c *carrier) bool {
 	now := time.Now()
 	mine, ok := c.quietMedian(now)
@@ -522,7 +653,7 @@ func (p *pool) slower(c *carrier) bool {
 	p.mu.Lock()
 	best := time.Duration(-1)
 	for _, o := range p.carriers {
-		if o == nil || o == c || !o.conn.Acked() || o.session.IsClosed() {
+		if o == nil || o == c || o.server != c.server || !o.conn.Acked() || o.session.IsClosed() {
 			continue
 		}
 		if m, ok := o.quietMedian(now); ok && (best < 0 || m < best) {
@@ -569,8 +700,16 @@ func (p *pool) probeOutage() {
 		defer p.probing.Store(false)
 		log.Printf("link: no carrier answered a ping in time, probing")
 		for p.linkQuiet() {
-			c, err := p.dial()
+			server, wait := p.nextServer(time.Now())
+			if wait > 0 {
+				time.Sleep(probeBackoff(wait))
+				continue
+			}
+			c, err := p.dial(server)
 			if err != nil {
+				log.Printf("link: probe to server %s: %v", server, err)
+				// Probing recovers from an outage; it must not drive the longer
+				// per-server backoff that maintain uses. Retry at a short fixed pace.
 				time.Sleep(minBackoff)
 				continue
 			}
@@ -580,8 +719,10 @@ func (p *pool) probeOutage() {
 			}
 			if !c.conn.Acked() {
 				c.session.Close()
+				time.Sleep(minBackoff)
 				continue
 			}
+			p.serverAcked(server)
 			p.mu.Lock()
 			p.standby = append(p.standby, c)
 			p.wake()
@@ -591,6 +732,12 @@ func (p *pool) probeOutage() {
 			return
 		}
 	}()
+}
+
+// probeBackoff caps a per-server backoff wait for outage probing, so a long maintain
+// backoff cannot stall the probe that must find a recovered path.
+func probeBackoff(wait time.Duration) time.Duration {
+	return min(wait, minBackoff)
 }
 
 // retire keeps a standby carrier for its existing streams, which survive a short
@@ -608,7 +755,7 @@ func (p *pool) retire(c *carrier) {
 	for {
 		select {
 		case <-c.session.CloseChan():
-			log.Printf("carrier %d: standby closed after %s: %s", c.slot, c.lifetime(), c.closeReason())
+			log.Printf("carrier %d: server %s: standby closed after %s: %s", c.slot, c.server, c.lifetime(), c.closeReason())
 			return
 		case <-tick.C:
 			if c.conn.ReadErr() != nil {
@@ -617,12 +764,12 @@ func (p *pool) retire(c *carrier) {
 			}
 			if c.session.NumStreams() == 0 && p.replaced(c.slot) {
 				c.session.Close()
-				log.Printf("carrier %d: standby retired after %s", c.slot, c.lifetime())
+				log.Printf("carrier %d: server %s: standby retired after %s", c.slot, c.server, c.lifetime())
 				return
 			}
 			if c.pongOverdue(deadAfter) {
 				c.session.Close()
-				log.Printf("carrier %d: standby closed after %s: no pong for %s", c.slot, c.lifetime(), deadAfter)
+				log.Printf("carrier %d: server %s: standby closed after %s: no pong for %s", c.slot, c.server, c.lifetime(), deadAfter)
 				return
 			}
 			c.ping(time.Now())
@@ -662,7 +809,7 @@ func (p *pool) pick() *carrier {
 	if p.opened == 0 {
 		p.grow()
 	}
-	best := quickest(p.carriers)
+	best := quickest(p.carriers, p.waitBand)
 	if best != nil && (best.session.NumStreams() > 0 || !p.spare(best)) {
 		// Keep an idle carrier in reserve: open another in the background as soon as
 		// this one takes a stream, so a request that arrives during a long download
@@ -710,7 +857,7 @@ func fewestStreams(carriers []*carrier, eligible func(*carrier) bool) *carrier {
 
 // quickest picks the acknowledged carrier where a new stream should hear back
 // soonest, skipping any whose server is going away before watch moves it to standby.
-func quickest(carriers []*carrier) *carrier {
+func quickest(carriers []*carrier, band time.Duration) *carrier {
 	now := time.Now()
 	var acked []*carrier
 	var waits []time.Duration
@@ -726,20 +873,20 @@ func quickest(carriers []*carrier) *carrier {
 	if len(acked) == 0 {
 		return nil
 	}
-	return acked[choose(waits, streams)]
+	return acked[choose(waits, streams, band)]
 }
 
 // choose returns which carrier to use from each one's expected wait, negative when
-// unknown, and stream count. Waits within a band of the best count as tied, and so
-// do unknown ones; among the tied, the fewest streams wins.
-func choose(waits []time.Duration, streams []int) int {
+// unknown, and stream count. Waits within band of the best count as tied, and so do
+// unknown ones; among the tied, the fewest streams wins.
+func choose(waits []time.Duration, streams []int, band time.Duration) int {
 	fastest := time.Duration(-1)
 	for _, w := range waits {
 		if w >= 0 && (fastest < 0 || w < fastest) {
 			fastest = w
 		}
 	}
-	limit := fastest + max(fastest/4, minWaitBand)
+	limit := fastest + max(fastest/4, band)
 	best := -1
 	for i, w := range waits {
 		if fastest >= 0 && w > limit {

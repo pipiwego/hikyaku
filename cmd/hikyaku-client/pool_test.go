@@ -16,7 +16,7 @@ import (
 
 func TestPoolKeepsSpare(t *testing.T) {
 	psk := "spare-carrier-test"
-	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 4)
 
 	// The first stream rides the first carrier while it is still unacknowledged.
 	_, first, err := p.openStream()
@@ -42,7 +42,7 @@ func TestPoolKeepsSpare(t *testing.T) {
 
 func TestQuickestSkipsGoingAway(t *testing.T) {
 	psk := "goaway-pick-test"
-	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 4)
 	_, first, err := p.openStream()
 	if err != nil {
 		t.Fatal(err)
@@ -60,14 +60,14 @@ func TestQuickestSkipsGoingAway(t *testing.T) {
 	p.mu.Unlock()
 	// Between GOAWAY and the next health check the carrier is still in its slot; mark
 	// the one that would be picked.
-	going := quickest(carriers)
+	going := quickest(carriers, p.waitBand)
 	if going == nil {
 		t.Fatal("no carrier picked")
 	}
 	reason := "test"
 	going.goaway.Store(&reason)
 	for range 20 {
-		c := quickest(carriers)
+		c := quickest(carriers, p.waitBand)
 		if c == nil {
 			t.Fatal("picked no carrier, want the one whose server is not going away")
 		}
@@ -81,9 +81,9 @@ func TestQuickestSkipsGoingAway(t *testing.T) {
 // left, such as before its acknowledgement or before watch moves it to standby.
 func TestPickSkipsGoingAway(t *testing.T) {
 	psk := "goaway-fallback-test"
-	p := newPool(startServer(t, psk), []byte(psk), 1)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 1)
 	p.opened = 1 // the test supplies the carrier itself, so no health check moves it
-	c, err := p.dial()
+	c, err := p.dial(p.servers[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestPickSkipsGoingAway(t *testing.T) {
 
 func TestPoolWarm(t *testing.T) {
 	psk := "warm-pool-test"
-	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 4)
 	p.warm()
 	waitFor(t, "the first carrier acknowledged without any request", func() bool { return p.acked() == 1 })
 	p.mu.Lock()
@@ -106,6 +106,63 @@ func TestPoolWarm(t *testing.T) {
 	p.mu.Unlock()
 	if opened != 1 {
 		t.Fatalf("opened %d slots, want 1", opened)
+	}
+}
+
+// Carriers are spread round-robin across the configured servers, not piled onto the
+// first one.
+func TestPoolSpreadsCarriersAcrossServers(t *testing.T) {
+	psk := "multi-server-spread-test"
+	a := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	b := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	p := newPool([]string{a, b}, []byte(psk), 2)
+	p.warm()
+	waitFor(t, "the first carrier acknowledged", func() bool { return p.acked() == 1 })
+	if _, s, err := p.openStream(); err != nil {
+		t.Fatal(err)
+	} else {
+		s.Close()
+	}
+	waitFor(t, "both carriers acknowledged", func() bool { return p.acked() == 2 })
+	p.mu.Lock()
+	servers := make(map[string]int)
+	for _, c := range p.carriers {
+		if c != nil {
+			servers[c.server]++
+		}
+	}
+	p.mu.Unlock()
+	if servers[a] != 1 || servers[b] != 1 {
+		t.Fatalf("carriers on %v, want one on each of %s and %s", servers, a, b)
+	}
+}
+
+// A dead server is backed off without blocking a healthy one: the first carrier
+// still comes up on the healthy server.
+func TestPoolFailsOverToHealthyServer(t *testing.T) {
+	psk := "multi-server-failover-test"
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadAddr := dead.Addr().String()
+	dead.Close()
+	healthy := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+
+	p := newPool([]string{deadAddr, healthy}, []byte(psk), 1)
+	p.warm()
+	waitFor(t, "a carrier on the healthy server", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		c := p.carriers[0]
+		return c != nil && c.server == healthy && c.conn.Acked()
+	})
+
+	p.mu.Lock()
+	failures := p.states[0].failures
+	p.mu.Unlock()
+	if failures == 0 {
+		t.Fatal("the dead server recorded no failure")
 	}
 }
 
@@ -127,7 +184,7 @@ func TestOpenStreamRetriesAnotherCarrier(t *testing.T) {
 			t.Cleanup(func() { conn.Close() })
 		}
 	}()
-	broken, err := newPool(silent.Addr().String(), []byte(psk), 1).dial()
+	broken, err := newPool([]string{silent.Addr().String()}, []byte(psk), 1).dial(silent.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +192,7 @@ func TestOpenStreamRetriesAnotherCarrier(t *testing.T) {
 	// Its writes now fail while its reads, and so the carrier, stay up.
 	broken.conn.Conn.(*net.TCPConn).CloseWrite()
 
-	p := newPool(startServer(t, psk), []byte(psk), 2)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 2)
 	p.opened = 2 // the test supplies the carriers itself
 	p.set(0, broken)
 	type opened struct {
@@ -150,7 +207,7 @@ func TestOpenStreamRetriesAnotherCarrier(t *testing.T) {
 		}
 		done <- opened{c, err}
 	}()
-	good, err := p.dial()
+	good, err := p.dial(p.servers[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +233,7 @@ func TestOpenStreamRetriesAnotherCarrier(t *testing.T) {
 // starts the client and sends requests at once, waits for it instead of failing.
 func TestPoolWarmBurst(t *testing.T) {
 	psk := "warm-burst-test"
-	p := newPool(startServer(t, psk), []byte(psk), 4)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 4)
 	p.warm()
 	var wg sync.WaitGroup
 	for range 8 {
@@ -198,7 +255,7 @@ func TestPoolWarmBurst(t *testing.T) {
 // the server's handling of a RESET that overtakes its stream's SYN relies on.
 func TestPoolWakesWaiters(t *testing.T) {
 	psk := "wake-waiters-test"
-	p := newPool(startServer(t, psk), []byte(psk), 1)
+	p := newPool([]string{startServer(t, psk)}, []byte(psk), 1)
 	p.opened = 1 // the test supplies the carrier itself, so it decides when one appears
 	done := make(chan error, 1)
 	go func() {
@@ -209,7 +266,7 @@ func TestPoolWakesWaiters(t *testing.T) {
 		done <- err
 	}()
 	time.Sleep(100 * time.Millisecond)
-	c, err := p.dial()
+	c, err := p.dial(p.servers[0])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,22 +356,288 @@ func TestChoose(t *testing.T) {
 	ms := time.Millisecond
 	cases := []struct {
 		name    string
+		band    time.Duration
 		waits   []time.Duration
 		streams []int
 		want    int
 	}{
-		{"a clearly quicker carrier beats fewer streams", []time.Duration{600 * ms, 1200 * ms}, []int{3, 0}, 0},
-		{"within the band, fewest streams wins", []time.Duration{600 * ms, 700 * ms}, []int{3, 0}, 1},
-		{"the band is at least minWaitBand", []time.Duration{30 * ms, 45 * ms}, []int{2, 0}, 1},
-		{"just outside a small band", []time.Duration{30 * ms, 60 * ms}, []int{2, 0}, 0},
-		{"an unknown wait counts as tied", []time.Duration{-1, 600 * ms}, []int{0, 2}, 0},
-		{"all unknown falls back to fewest streams", []time.Duration{-1, -1}, []int{1, 0}, 1},
-		{"equal carriers keep slot order", []time.Duration{600 * ms, 600 * ms}, []int{1, 1}, 0},
+		// One server keeps the 20ms band, so small round-trip differences on its
+		// shared path count as tied.
+		{"single server: a clearly quicker carrier beats fewer streams", minWaitBand, []time.Duration{600 * ms, 1200 * ms}, []int{3, 0}, 0},
+		{"single server: within the band, fewest streams wins", minWaitBand, []time.Duration{600 * ms, 700 * ms}, []int{3, 0}, 1},
+		{"single server: the band is at least minWaitBand", minWaitBand, []time.Duration{30 * ms, 45 * ms}, []int{2, 0}, 1},
+		{"single server: just outside the band", minWaitBand, []time.Duration{30 * ms, 60 * ms}, []int{2, 0}, 0},
+		// Across servers the band is 5ms, so a few milliseconds pick the quicker route.
+		{"multiple servers: within the band, fewest streams wins", multiServerWaitBand, []time.Duration{30 * ms, 32 * ms}, []int{2, 0}, 1},
+		{"multiple servers: 18ms does not lose to 25ms", multiServerWaitBand, []time.Duration{18 * ms, 25 * ms}, []int{1, 0}, 0},
+		{"an unknown wait counts as tied", minWaitBand, []time.Duration{-1, 600 * ms}, []int{0, 2}, 0},
+		{"all unknown falls back to fewest streams", minWaitBand, []time.Duration{-1, -1}, []int{1, 0}, 1},
+		{"equal carriers keep slot order", minWaitBand, []time.Duration{600 * ms, 600 * ms}, []int{1, 1}, 0},
 	}
 	for _, c := range cases {
-		if got := choose(c.waits, c.streams); got != c.want {
+		if got := choose(c.waits, c.streams, c.band); got != c.want {
 			t.Errorf("%s: chose %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// A server that goes away makes every carrier fail in the same round; those failures
+// share one backoff window instead of multiplying the wait by the carrier count.
+func TestDialFailedBacksOffOncePerWindow(t *testing.T) {
+	p := newPool([]string{"[2001:db8::a]:8444"}, nil, 4)
+	server := p.servers[0]
+	for range 4 {
+		p.dialFailed(server)
+	}
+	p.mu.Lock()
+	failures := p.states[0].failures
+	wait := time.Until(p.states[0].nextTry)
+	p.mu.Unlock()
+	if failures != 1 {
+		t.Fatalf("%d failures after four dials in one round, want 1", failures)
+	}
+	if wait < 900*time.Millisecond || wait > 1100*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", wait, minBackoff)
+	}
+
+	p.mu.Lock()
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.dialFailed(server)
+	p.mu.Lock()
+	failures = p.states[0].failures
+	wait = time.Until(p.states[0].nextTry)
+	p.mu.Unlock()
+	if failures != 2 {
+		t.Fatalf("%d failures after the window passed, want 2", failures)
+	}
+	if wait < 1800*time.Millisecond || wait > 2200*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", wait, 2*minBackoff)
+	}
+}
+
+// Servers are tried round-robin, and when all of them are backing off the earliest
+// one is returned with the time left to wait for it.
+func TestNextServerRotatesAndWaits(t *testing.T) {
+	p := newPool([]string{"[2001:db8::a]:8444", "[2001:db8::b]:8444"}, nil, 1)
+	now := time.Now()
+	if got, wait := p.nextServer(now); got != p.servers[0] || wait != 0 {
+		t.Fatalf("first server %q after %s, want %q at once", got, wait, p.servers[0])
+	}
+	if got, wait := p.nextServer(now); got != p.servers[1] || wait != 0 {
+		t.Fatalf("second server %q after %s, want %q at once", got, wait, p.servers[1])
+	}
+	p.dialFailed(p.servers[0])
+	// Let the second failure of the first server count, so the two backoffs differ.
+	p.mu.Lock()
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.dialFailed(p.servers[0])
+	p.dialFailed(p.servers[1])
+	got, wait := p.nextServer(time.Now())
+	if got != p.servers[1] {
+		t.Fatalf("waited for %q, want the server available soonest, %q", got, p.servers[1])
+	}
+	if wait <= 0 || wait > time.Second {
+		t.Fatalf("wait %s, want the remaining part of the first backoff, up to %s", wait, time.Second)
+	}
+	p.serverAcked(p.servers[1])
+	if got, wait := p.nextServer(time.Now()); got != p.servers[1] || wait != 0 {
+		t.Fatalf("after the backoff reset: %q after %s, want %q at once", got, wait, p.servers[1])
+	}
+}
+
+// Consecutive rejections grow each server's own window. Switching servers between
+// rejections does not restart the backoff, and one server's window is not cleared by
+// another server's failure.
+func TestRejectionsBackOffPerServer(t *testing.T) {
+	a, b := "[2001:db8::a]:8444", "[2001:db8::b]:8444"
+	p := newPool([]string{a, b}, nil, 2)
+	p.rejectFailed(a)
+	p.rejectFailed(b)
+
+	p.mu.Lock()
+	aFailures, bFailures := p.states[0].failures, p.states[1].failures
+	aWait, bWait := time.Until(p.states[0].nextTry), time.Until(p.states[1].nextTry)
+	p.mu.Unlock()
+	if aFailures != 1 || bFailures != 1 {
+		t.Fatalf("failures after one rejection each: %d and %d, want 1 and 1", aFailures, bFailures)
+	}
+	for server, wait := range map[string]time.Duration{a: aWait, b: bWait} {
+		if wait < 900*time.Millisecond || wait > 1100*time.Millisecond {
+			t.Fatalf("server %s next try in %s, want about %s", server, wait, minBackoff)
+		}
+	}
+
+	// Let only A's window pass. A's next rejection grows its own count without
+	// touching B's window.
+	p.mu.Lock()
+	bNext := p.states[1].nextTry
+	p.states[0].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.rejectFailed(a)
+	p.mu.Lock()
+	aFailures, bFailures = p.states[0].failures, p.states[1].failures
+	aWait = time.Until(p.states[0].nextTry)
+	bNextNow := p.states[1].nextTry
+	p.mu.Unlock()
+	if aFailures != 2 {
+		t.Fatalf("%d failures on the rejecting server after its window passed, want 2", aFailures)
+	}
+	if aWait < 1800*time.Millisecond || aWait > 2200*time.Millisecond {
+		t.Fatalf("next try in %s, want about %s", aWait, 2*minBackoff)
+	}
+	if bFailures != 1 || !bNextNow.Equal(bNext) {
+		t.Fatalf("the other server changed to %d failures and next try %s, want 1 and %s", bFailures, bNextNow, bNext)
+	}
+
+	// B also grows to two, so neither server's window erased the other's.
+	p.mu.Lock()
+	p.states[1].nextTry = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+	p.rejectFailed(b)
+	p.mu.Lock()
+	bFailures = p.states[1].failures
+	p.mu.Unlock()
+	if bFailures != 2 {
+		t.Fatalf("%d failures on the second rejecting server after its window passed, want 2", bFailures)
+	}
+}
+
+// quickest compares carriers from different servers on their round trips, not on
+// which server they came from.
+func TestQuickestAcrossServers(t *testing.T) {
+	psk := "multi-server-quickest-test"
+	a := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	b := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	p := newPool([]string{a, b}, []byte(psk), 2)
+	slow, err := p.dial(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.session.Close()
+	fast, err := p.dial(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.session.Close()
+	waitFor(t, "both carriers acknowledged", func() bool { return slow.conn.Acked() && fast.conn.Acked() })
+	slow.slot, fast.slot = 0, 1
+	slow.sample(20 * time.Millisecond)
+	fast.sample(5 * time.Millisecond)
+	// More streams must not hide the round-trip difference between servers.
+	for range 2 {
+		if _, err := fast.session.OpenStream(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := quickest([]*carrier{slow, fast}, multiServerWaitBand); got != fast {
+		t.Fatalf("multi-server pool picked carrier on %s with %d streams, want the faster %s", got.server, got.session.NumStreams(), fast.server)
+	}
+	// The 20ms single-server band ties 20ms with 5ms, so there the fewer streams win.
+	if got := quickest([]*carrier{slow, fast}, minWaitBand); got != slow {
+		t.Fatalf("single-server pool picked carrier on %s with %d streams, want the one with fewer streams on %s", got.server, got.session.NumStreams(), slow.server)
+	}
+}
+
+// Slowness is judged within one server. A healthy but slower server is chosen against
+// by quickest, not retired and redialed as a slow carrier.
+func TestSlowerOnlyComparesWithinServer(t *testing.T) {
+	psk := "slower-within-server-test"
+	a := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	b := fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})
+	p := newPool([]string{a, b}, []byte(psk), 2)
+	slow, err := p.dial(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.session.Close()
+	fast, err := p.dial(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.session.Close()
+	waitFor(t, "both carriers acknowledged", func() bool { return slow.conn.Acked() && fast.conn.Acked() })
+	slow.slot, fast.slot = 0, 1
+	p.set(0, slow)
+	p.set(1, fast)
+	now := time.Now()
+	slow.quiet = []sample{{now, 900 * time.Millisecond}, {now, 900 * time.Millisecond}, {now, 900 * time.Millisecond}}
+	fast.quiet = []sample{{now, 30 * time.Millisecond}, {now, 30 * time.Millisecond}, {now, 30 * time.Millisecond}}
+	if p.slower(slow) {
+		t.Fatalf("the only carrier on %s was judged slow against another server", slow.server)
+	}
+
+	sameServer, err := p.dial(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sameServer.session.Close()
+	waitFor(t, "the second carrier on the same server acknowledged", sameServer.conn.Acked)
+	sameServer.slot = 1
+	sameServer.quiet = fast.quiet
+	p.set(1, sameServer)
+	if !p.slower(slow) {
+		t.Fatalf("carrier on %s was not judged slow against a quicker carrier on its own server", slow.server)
+	}
+}
+
+// A pool needs a server; the CLI checks this, but library and test callers must not
+// get an empty round-robin that spins at full speed.
+func TestNewPoolNeedsServer(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("newPool with no servers did not panic")
+		}
+	}()
+	newPool(nil, nil, 1)
+}
+
+// The wait band depends on how many servers the pool may use.
+func TestNewPoolWaitBand(t *testing.T) {
+	if got := newPool([]string{"[2001:db8::a]:8444"}, nil, 1).waitBand; got != minWaitBand {
+		t.Fatalf("single-server wait band %s, want %s", got, minWaitBand)
+	}
+	if got := newPool([]string{"[2001:db8::a]:8444", "[2001:db8::b]:8444"}, nil, 1).waitBand; got != multiServerWaitBand {
+		t.Fatalf("multi-server wait band %s, want %s", got, multiServerWaitBand)
+	}
+}
+
+// Duplicate addresses collapse to one server so each address has one state and
+// nextServer never rotates between identical entries.
+func TestNewPoolDeduplicatesServers(t *testing.T) {
+	a, b := "[2001:db8::a]:8444", "[2001:db8::b]:8444"
+	p := newPool([]string{a, a, b, a}, nil, 1)
+	if len(p.servers) != 2 || p.servers[0] != a || p.servers[1] != b {
+		t.Fatalf("servers %v, want [%q %q]", p.servers, a, b)
+	}
+	if len(p.states) != len(p.servers) {
+		t.Fatalf("%d states for %d servers", len(p.states), len(p.servers))
+	}
+	if p.state(a) == p.state(b) {
+		t.Fatal("both addresses resolved to the same server state")
+	}
+	if got := p.waitBand; got != multiServerWaitBand {
+		t.Fatalf("wait band %s, want %s based on the two unique servers", got, multiServerWaitBand)
+	}
+
+	single := newPool([]string{a, a, a}, nil, 1)
+	if len(single.servers) != 1 || single.waitBand != minWaitBand {
+		t.Fatalf("%d servers with wait band %s, want one server and %s", len(single.servers), single.waitBand, minWaitBand)
+	}
+}
+
+// Outage probes wait at most one short backoff step, so a long maintain backoff
+// cannot stall probing for a recovered path.
+func TestProbeBackoffCapsWait(t *testing.T) {
+	if got := probeBackoff(maxBackoff); got != minBackoff {
+		t.Fatalf("probe wait %s, want %s", got, minBackoff)
+	}
+	if got := probeBackoff(250 * time.Millisecond); got != 250*time.Millisecond {
+		t.Fatalf("probe wait %s, want the shorter wait unchanged", got)
+	}
+	if got := probeBackoff(0); got != 0 {
+		t.Fatalf("probe wait %s, want none", got)
 	}
 }
 
@@ -452,7 +775,7 @@ func (p *pool) standing() []*carrier {
 
 func TestUnansweredPingStandsBy(t *testing.T) {
 	psk := "unanswered-ping-test"
-	p := newPool(fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {}), []byte(psk), 1)
+	p := newPool([]string{fakeServer(t, psk, func(*proxy.Conn, *smux.Session) {})}, []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
 	deadline := time.Now().Add(healthCheck + maxReplyDeadline + 3*time.Second)
@@ -467,7 +790,7 @@ func TestUnansweredPingStandsBy(t *testing.T) {
 func TestDataKeepsCarrierAlive(t *testing.T) {
 	psk := "data-keeps-alive-test"
 	stop := make(chan struct{})
-	p := newPool(fakeServer(t, psk, func(_ *proxy.Conn, s *smux.Session) {
+	p := newPool([]string{fakeServer(t, psk, func(_ *proxy.Conn, s *smux.Session) {
 		st, err := s.AcceptStream()
 		if err != nil {
 			return
@@ -484,7 +807,7 @@ func TestDataKeepsCarrierAlive(t *testing.T) {
 				}
 			}
 		}
-	}), []byte(psk), 1)
+	})}, []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
 	// Opened through the pool, so its acknowledgement is awaited as well.
@@ -550,7 +873,7 @@ func pingServer(t *testing.T, psk string, drop func(id uint32) bool) string {
 
 func TestDroppedPingsKeepCarrier(t *testing.T) {
 	psk := "dropped-pings-test"
-	p := newPool(pingServer(t, psk, func(id uint32) bool { return id < 3 }), []byte(psk), 1)
+	p := newPool([]string{pingServer(t, psk, func(id uint32) bool { return id < 3 })}, []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier acknowledged", func() bool { return p.acked() == 1 })
 	p.mu.Lock()
@@ -575,10 +898,10 @@ func TestDroppedPingsKeepCarrier(t *testing.T) {
 func TestGoAwayStandsBy(t *testing.T) {
 	psk := "goaway-test"
 	var carriers atomic.Int32
-	p := newPool(fakeServer(t, psk, func(c *proxy.Conn, _ *smux.Session) {
+	p := newPool([]string{fakeServer(t, psk, func(c *proxy.Conn, _ *smux.Session) {
 		carriers.Add(1)
 		c.WriteControl(proxy.CtrlGoAway, []byte{proxy.GoAwayShutdown, 4, 't', 'e', 's', 't'})
-	}), []byte(psk), 1)
+	})}, []byte(psk), 1)
 	p.warm()
 	waitFor(t, "the carrier to stand by", func() bool { return len(p.standing()) > 0 })
 	if reason := p.standing()[0].goaway.Load(); reason == nil || *reason != "test" {
@@ -614,7 +937,7 @@ func TestRejectedCarriersBackOff(t *testing.T) {
 			conn.Close()
 		}
 	}()
-	p := newPool(ln.Addr().String(), []byte("wrong-psk"), 1)
+	p := newPool([]string{ln.Addr().String()}, []byte("wrong-psk"), 1)
 	p.warm()
 	time.Sleep(5 * time.Second)
 	// Backing off 1, 2 and 4 s after each rejection allows about three dials in 5 s.

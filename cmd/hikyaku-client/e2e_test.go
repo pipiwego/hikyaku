@@ -58,7 +58,7 @@ func startServer(t testing.TB, psk string) string {
 
 func startClient(t testing.TB, server string, psk []byte) socksClient {
 	t.Helper()
-	p := newPool(server, psk, 2)
+	p := newPool([]string{server}, psk, 2)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
