@@ -72,17 +72,21 @@ The client exposes a local SOCKS5 proxy, supporting both TCP (`CONNECT`) and UDP
 hikyaku-client -server 203.0.113.10:8444 -psk 'your-psk'
 # full client example with custom listen port
 hikyaku-client -listen 127.0.0.1:11080 -server 203.0.113.10:8444 -psk 'your-psk' -carriers 8
+# several IPv6 addresses of one VPS; carriers spread across them and fail over
+hikyaku-client -server '[2001:db8::a]:8444' -server '[2001:db8::b]:8444' -psk 'your-psk'
+# the same, with comma-separated addresses
+hikyaku-client -server '[2001:db8::a]:8444,[2001:db8::b]:8444' -psk 'your-psk'
 
 # test the SOCKS5 proxy through the client
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
 
-| Flag        | Default          | Description                                                     |
-| ----------- | ---------------- | --------------------------------------------------------------- |
-| `-listen`   | `127.0.0.1:1080` | SOCKS5 listen address                                           |
-| `-server`   | (required)       | Server address, `host:port`                                     |
-| `-psk`      | (required)       | Pre-shared key, the same as the server's                        |
-| `-carriers` | `4`              | Maximum number of active connections to the server (at least 1) |
+| Flag        | Default          | Description                                                                                                                                        |
+| ----------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-listen`   | `127.0.0.1:1080` | SOCKS5 listen address                                                                                                                              |
+| `-server`   | (required)       | Server address, `host:port`. Repeat the flag or separate addresses with commas to use several; carriers rotate across them and fail over           |
+| `-psk`      | (required)       | Pre-shared key, the same as the server's                                                                                                           |
+| `-carriers` | `4`              | Maximum number of active connections across all servers (at least 1)                                                                                |
 
 **Surge for Mac**
 
